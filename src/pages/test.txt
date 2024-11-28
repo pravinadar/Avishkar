@@ -1,0 +1,204 @@
+import React, { useState, useRef } from 'react';
+import { Card, Button } from 'react-bootstrap';
+import 'bootstrap/dist/css/bootstrap.min.css';
+import * as faceapi from '@vladmandic/face-api';
+import supabase from '../components/database'; // Import Supabase client
+
+const PeopleAnalysis = () => {
+  const [showCamera, setShowCamera] = useState(false);
+  const [maleCount, setMaleCount] = useState(0); // Count of detected males
+  const [femaleCount, setFemaleCount] = useState(0); // Count of detected females
+  const [finalMaleCount, setFinalMaleCount] = useState(0); // Final male count after camera stops
+  const [finalFemaleCount, setFinalFemaleCount] = useState(0); // Final female count after camera stops
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const [isPersonDetected, setIsPersonDetected] = useState(false);
+
+  const handleStartCamera = async () => {
+    try {
+      setShowCamera(true);
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      mediaStreamRef.current = stream;
+      videoRef.current.srcObject = stream;
+
+      videoRef.current.onloadedmetadata = async () => {
+        videoRef.current.play();
+        canvasRef.current.width = videoRef.current.videoWidth;
+        canvasRef.current.height = videoRef.current.videoHeight;
+
+        try {
+          // Load face-api models
+          await Promise.all([
+            faceapi.nets.tinyFaceDetector.loadFromUri('/models'),
+            faceapi.nets.faceLandmark68Net.loadFromUri('/models'),
+            faceapi.nets.ageGenderNet.loadFromUri('/models'),
+            faceapi.nets.faceRecognitionNet.loadFromUri('/models'),
+          ]);
+          detectFaces();
+        } catch (error) {
+          console.error('Error loading models:', error);
+        }
+      };
+    } catch (error) {
+      console.error('Error starting camera:', error);
+    }
+  };
+
+  const handleStopCamera = () => {
+    const stream = mediaStreamRef.current;
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+    }
+    setShowCamera(false);
+    setIsPersonDetected(false);
+
+    // Save final male and female count before stopping
+    setFinalMaleCount(maleCount);
+    setFinalFemaleCount(femaleCount);
+
+    // Save collected data to Supabase
+    saveDataToSupabase(maleCount, femaleCount);
+  };
+
+  const detectFaces = async () => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+
+    const detect = async () => {
+      if (video && canvas && video.videoWidth > 0 && video.videoHeight > 0) {
+        const detections = await faceapi
+          .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions())
+          .withAgeAndGender();
+
+        drawBoxes(canvas.getContext('2d'), video, detections);
+      }
+      requestAnimationFrame(detect);
+    };
+
+    detect();
+  };
+
+  const drawBoxes = (context, video, detections) => {
+    if (!context || !canvasRef.current) return;
+
+    context.clearRect(0, 0, video.videoWidth, video.videoHeight);
+    context.strokeStyle = 'red';
+    context.lineWidth = 2;
+
+    const scaleX = canvasRef.current.width / video.videoWidth;
+    const scaleY = canvasRef.current.height / video.videoHeight;
+
+    let maleCountThisFrame = 0;
+    let femaleCountThisFrame = 0;
+
+    detections.forEach(detection => {
+      const { x, y, width, height } = detection.detection.box;
+      context.strokeRect(x * scaleX, y * scaleY, width * scaleX, height * scaleY);
+
+      const gender = detection.gender === 'male' ? 'MALE' : 'FEMALE';
+
+      // Count male and female faces
+      if (gender === 'MALE') {
+        maleCountThisFrame++;
+      } else if (gender === 'FEMALE') {
+        femaleCountThisFrame++;
+      }
+    });
+
+    // Update total male and female count
+    setMaleCount(maleCountThisFrame);
+    setFemaleCount(femaleCountThisFrame);
+
+    if (maleCountThisFrame > 0 || femaleCountThisFrame > 0) {
+      setIsPersonDetected(true);
+    }
+  };
+
+  const saveDataToSupabase = async (totalMale, totalFemale) => {
+    const currentDate = new Date();
+    const date = currentDate.toISOString().split('T')[0]; // Get date in YYYY-MM-DD format
+    const time = currentDate.toTimeString().split(' ')[0]; // Get time in HH:MM:SS format
+
+    try {
+      const { data, error } = await supabase.from('analysis').insert([
+        {
+          Date: date,
+          "Total male": totalMale,
+          "Total Female": totalFemale,
+          Time: time,
+        },
+      ]);
+
+      if (error) {
+        console.error('Error inserting data into Supabase:', error.message);
+      } else {
+        console.log('Data inserted successfully:', data);
+      }
+    } catch (error) {
+      console.error('Error saving data to Supabase:', error);
+    }
+  };
+
+  return (
+    <div className="camera-container d-flex flex-column align-items-center" style={{ minHeight: '100vh' }}>
+      <h2 className="mb-4">Webcam People Analysis</h2>
+      <Card className="shadow" style={{ width: '100%', maxWidth: '600px' }}>
+        <Card.Body>
+          {showCamera ? (
+            <Button variant="danger" onClick={handleStopCamera}>
+              Stop Camera
+            </Button>
+          ) : (
+            <Button variant="primary" onClick={handleStartCamera}>
+              Start Camera
+            </Button>
+          )}
+        </Card.Body>
+      </Card>
+
+      {showCamera && (
+        <div className="video-stream mt-4" style={{ position: 'relative' }}>
+          <Card className="shadow">
+            <Card.Body>
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted
+                style={{ width: '100%', maxHeight: '400px', objectFit: 'cover' }}
+              />
+              <canvas
+                ref={canvasRef}
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  zIndex: 1,
+                  width: '100%',
+                  height: '100%',
+                }}
+              />
+            </Card.Body>
+          </Card>
+
+          {/* Display male and female count */}
+          <div className="detection-info mt-3">
+            <h4>Detected Males: {maleCount}</h4>
+            <h4>Detected Females: {femaleCount}</h4>
+          </div>
+        </div>
+      )}
+
+      {!showCamera && (finalMaleCount > 0 || finalFemaleCount > 0) && (
+        <div className="final-counts mt-4">
+          <h3>Final Counts After Stopping Camera</h3>
+          <h4>Final Male Count: {finalMaleCount}</h4>
+          <h4>Final Female Count: {finalFemaleCount}</h4>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default PeopleAnalysis;
